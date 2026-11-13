@@ -1,5 +1,14 @@
 // =========================================================
-// DRIVE CLASSIFIER + RECEIPT TAX TRACKER  (v5)
+// DRIVE CLASSIFIER + RECEIPT TAX TRACKER  (v6)
+// v6: setup problems (bad API key, retired model names, missing folder) pause the
+//     run and email you once a day, instead of failing every file;
+//     blank sheet rows no longer block re-logging (plus cleanupBlankTrackerRows);
+//     weekly summary email doubles as a heartbeat (no email = check the trigger)
+//     After independent review: each email MESSAGE is tracked in an "Email Import Log"
+//     tab (new receipts in old Gmail conversations are no longer missed); identical
+//     attachments are saved once (no double-logged forwards); daily email import cap;
+//     same Gemini error on 3 files = setup problem; scans are classified before
+//     email imports; email date used when a receipt's date is unreadable.
 // v5: imports receipts from Gmail into Brother before classifying
 //     (attachments saved as-is, emails without one saved as a PDF snapshot;
 //     failures are emailed to you). See EMAIL RECEIPT IMPORT section.
@@ -76,13 +85,16 @@ const TRACKER_HEADERS = [
   'Currency', 'Amount', 'Relief Subcategory', 'Notes', 'File Name', 'Receipt Link', 'File ID'
 ];
 
-// Email receipt import (v5)
+// Email receipt import (v5, reworked in v6)
 const EMAIL_IMPORT_ENABLED = true;                  // set false to switch email import off
 const EMAIL_KEYWORDS = ['receipt', 'invoice', 'resit'];
-// Never import emails older than this (Malaysia time). Labels stop repeats,
-// so a fixed start date does not make daily runs heavier.
+// Never import emails older than this (Malaysia time)
 const EMAIL_START_DATE = '2026-01-01T00:00:00+08:00';
-const EMAIL_MAX_THREADS_PER_RUN = 20;
+const EMAIL_LOG_TAB_NAME = 'Email Import Log';      // one row per email message handled
+const EMAIL_PAGE_SIZE = 50;                         // Gmail conversations fetched per page
+const EMAIL_MAX_PAGES_PER_RUN = 10;
+const EMAIL_RESCAN_DAYS = 45;                       // after the backlog: only look at the last 45 days
+const EMAIL_MAX_FILES_PER_DAY = 40;                 // stops a backlog from using up the daily Gemini cap
 const EMAIL_IMPORT_BUDGET_MS = 60 * 1000;           // max 1 minute per run, leaves time to classify
 const EMAIL_EXTRA_FILTERS = '-category:promotions -category:social -in:chats -subject:"Drive Classifier"';
 // Emails whose subject contains any of these are never imported (add more if junk shows up)
@@ -90,11 +102,16 @@ const EMAIL_EXCLUDE_SUBJECT_WORDS = ['interview', 'reminder', 'earnings', 'fund 
 // Emails from these senders are never imported. Use a name or an email address/domain.
 // Example: ['My Condo Management', 'newsletter@example.com']
 const EMAIL_EXCLUDE_SENDERS = [];
+// Gmail labels are for you to see what happened. The Email Import Log decides what is skipped.
 const EMAIL_IMPORTED_LABEL = 'Receipt-Imported';    // saved to Brother
 const EMAIL_FAILED_LABEL = 'Receipt-Failed';        // needs you; you get an email about it
 const EMAIL_SKIPPED_LABEL = 'Receipt-Skipped';      // matched the search but nothing to save
 const EMAIL_MIN_IMAGE_BYTES = 15 * 1024;            // smaller images are usually logos or signatures
 const EMAIL_MIN_BODY_CHARS = 40;                    // less text than this = image-only email
+
+// Health checks (v6)
+const SUMMARY_INTERVAL_DAYS = 7;    // weekly summary email; if it stops arriving, check the trigger
+const STALE_RUN_HOURS = 24;         // summary warns if the last good run is older than this
 
 
 // =========================================================
@@ -115,7 +132,21 @@ function processBrotherFolderFiles() {
       Logger.log('Email import error (classification continues): ' + e);
     }
     // Step 2: classify everything in Brother, including what was just imported
-    runClassifier_(runStart);
+    let classifyError = null;
+    try {
+      runClassifier_(runStart);
+    } catch (e) {
+      classifyError = e;
+      Logger.log('Classification error: ' + e);
+    }
+    // Step 3: weekly summary (sent at most once every 7 days)
+    try {
+      maybeSendWeeklySummary_();
+    } catch (e) {
+      Logger.log('Weekly summary error: ' + e);
+    }
+    // Re-throw so Apps Script still records the run as failed and can notify you
+    if (classifyError) throw classifyError;
   } finally {
     lock.releaseLock();
   }
@@ -126,6 +157,7 @@ function processBrotherFolderFiles() {
 // MAIN LOGIC
 // =========================================================
 function runClassifier_(runStart) {
+  RETIRED_MODELS_ = {};   // models found missing (404) are skipped for the rest of this run
   const startTime = runStart || Date.now();
   const deadline = startTime + MAX_EXECUTION_TIME_MS;
   const props = PropertiesService.getScriptProperties();
@@ -134,6 +166,8 @@ function runClassifier_(runStart) {
 
   if (!apiKey || apiKey.trim() === '') {
     Logger.log('CRITICAL ERROR: GEMINI_API_KEY is missing in Script Properties. Aborting run.');
+    recordRunStatus_(props, 'GEMINI_API_KEY is missing in Script Properties');
+    sendSetupAlert_(props, 'GEMINI_API_KEY is missing in Script Properties (Project Settings > Script Properties).');
     return;
   }
 
@@ -142,6 +176,9 @@ function runClassifier_(runStart) {
   const sourceFolder = findChildFolder_(rootFolder, SOURCE_FOLDER_NAME);
   if (!sourceFolder) {
     Logger.log('Source folder "' + SOURCE_FOLDER_NAME + '" not found in Root directory.');
+    recordRunStatus_(props, 'Source folder "' + SOURCE_FOLDER_NAME + '" not found');
+    sendSetupAlert_(props, 'The "' + SOURCE_FOLDER_NAME + '" folder was not found at the top level of My Drive. ' +
+                           'Was it renamed, moved or trashed?');
     return;
   }
   Logger.log('Connected to source folder: ' + sourceFolder.getName() + ' (ID: ' + sourceFolder.getId() + ')');
@@ -180,6 +217,7 @@ function runClassifier_(runStart) {
   if (Date.now() < blockedUntil) {
     Logger.log('Daily Gemini quota was reached earlier. Skipping classification until ' +
                Utilities.formatDate(new Date(blockedUntil), TZ, 'yyyy-MM-dd HH:mm') + ' (MYT).');
+    recordRunStatus_(props, '');   // healthy, just waiting for the quota to reset
     return;
   }
 
@@ -208,7 +246,15 @@ function runClassifier_(runStart) {
   Logger.log('Tracker sheet ready. Receipts already logged: ' + loggedIds.size);
 
   // 5. PROCESS FILES IN BROTHER
-  const files = sourceFolder.getFiles();
+  // Phone scans first, then email imports, so an email backlog can't hold up your scans
+  const fileList = [];
+  const fileIterator = sourceFolder.getFiles();
+  while (fileIterator.hasNext() && fileList.length < 500) {
+    const f = fileIterator.next();
+    fileList.push({ file: f, fromEmail: /^Receipt_Email_/.test(f.getName()) });
+  }
+  fileList.sort((a, b) => (a.fromEmail ? 1 : 0) - (b.fromEmail ? 1 : 0));
+
   let brotherFileCount = 0;
   let apiCallCount = 0;
   let processedCount = 0;
@@ -216,14 +262,19 @@ function runClassifier_(runStart) {
   let failedFilesCount = 0;
   let receiptsLogged = 0;
   let dailyQuotaHit = false;
+  let setupProblem = '';
+  // Gemini errors are only counted against files at the end of the run, so that
+  // if the same error turns out to hit many files (a setup problem), no file is blamed
+  const pendingFailures = [];
+  const filesPerError = {};
 
-  while (files.hasNext()) {
+  for (let i = 0; i < fileList.length; i++) {
     if (Date.now() > deadline) {
       Logger.log('Approaching script timeout. Remaining files will process on next run.');
       break;
     }
 
-    const file = files.next();
+    const file = fileList[i].file;
     brotherFileCount++;
 
     try {
@@ -249,6 +300,13 @@ function runClassifier_(runStart) {
         Logger.log('Not enough time left for a safe API call. Stopping; file stays in Brother.');
         break;
       }
+      if (result.systemic) {
+        // A setup problem affects every file, so it must never count against this one
+        setupProblem = result.reason;
+        Logger.log('SETUP PROBLEM: ' + result.reason +
+                   ' Stopping run; files stay in Brother and are not counted as failures.');
+        break;
+      }
       if (result.quotaHit) {
         if (result.daily) {
           const until = Date.now() + msUntilPacificMidnight_();
@@ -271,11 +329,16 @@ function runClassifier_(runStart) {
         continue;
       }
       if (result.apiError) {
-        if (recordFailure_(props, file, failedFolder)) {
-          failedFilesCount++;
-          Logger.log('File failed ' + MAX_FAILURES_PER_FILE + ' times. Moved to Failed.');
-        } else {
-          Logger.log('API failed for this file (left in Brother, will retry next run): ' + file.getName());
+        pendingFailures.push(file);
+        Logger.log('API failed for this file (counted at the end of the run): ' + file.getName());
+        // Same error on 3 different files = a setup problem, unless the error is about the document itself
+        if (result.errorKey && !/document|file|pdf|image|page|mime|password|encrypt|corrupt/i.test(result.errorKey)) {
+          filesPerError[result.errorKey] = (filesPerError[result.errorKey] || 0) + 1;
+          if (filesPerError[result.errorKey] >= 3) {
+            setupProblem = 'The same Gemini error hit 3 different files in one run: ' + result.errorKey;
+            Logger.log('SETUP PROBLEM: ' + setupProblem + ' Stopping run; no file is counted as failed.');
+            break;
+          }
         }
         continue;
       }
@@ -286,7 +349,9 @@ function runClassifier_(runStart) {
 
       const createdDate = file.getDateCreated();
       const scanTimeStr = Utilities.formatDate(createdDate, TZ, 'HHmm');
-      const dateCheck = validateTransactionDate_(result.transactionDate, createdDate);
+      // Email imports fall back to the email's date (in the file name), not the import date
+      const fallbackDate = emailDateFromName_(file.getName()) || createdDate;
+      const dateCheck = validateTransactionDate_(result.transactionDate, fallbackDate);
       const effectiveDateStr = dateCheck.dateStr;
       const documentYear = effectiveDateStr.substring(0, 4);
       if (dateCheck.note) Logger.log('Date note: ' + dateCheck.note);
@@ -371,10 +436,30 @@ function runClassifier_(runStart) {
     }
   }
 
+  // Count Gemini failures against their files, unless this run found a setup problem
+  if (setupProblem) {
+    if (pendingFailures.length) Logger.log('Not counting ' + pendingFailures.length + ' file failure(s): setup problem.');
+  } else {
+    pendingFailures.forEach(file => {
+      try {
+        if (recordFailure_(props, file, failedFolder)) {
+          failedFilesCount++;
+          Logger.log('File failed ' + MAX_FAILURES_PER_FILE + ' times. Moved to Failed: ' + safeName_(file));
+        }
+      } catch (e) {
+        Logger.log('Could not record failure: ' + e);
+      }
+    });
+  }
+
   Logger.log('Execution complete. Inspected: ' + brotherFileCount +
              ', Processed: ' + processedCount +
              ', Receipts logged: ' + receiptsLogged +
              ', Failed: ' + failedFilesCount);
+
+  if (processedCount > 0) props.setProperty('LAST_CLASSIFY_SUCCESS', String(Date.now()));
+  recordRunStatus_(props, setupProblem);
+  if (setupProblem) sendSetupAlert_(props, setupProblem);
 
   // 6. EMAIL NOTICE (only when something needs your attention)
   const email = Session.getEffectiveUser().getEmail();
@@ -404,9 +489,11 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
 
   let lastStatus = null;
   let sawException = false;
+  let notFoundCount = 0;   // models that returned 404
 
   for (let m = 0; m < GEMINI_MODELS.length; m++) {
     const modelName = GEMINI_MODELS[m];
+    if (RETIRED_MODELS_[modelName]) { notFoundCount++; continue; }   // already 404'd this run
     const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + modelName + ':generateContent';
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MODEL; attempt++) {
@@ -453,7 +540,9 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
       }
 
       if (status === 404) {
-        Logger.log('Model ' + modelName + ' returned 404. Switching to next fallback model...');
+        notFoundCount++;
+        RETIRED_MODELS_[modelName] = true;
+        Logger.log('Model ' + modelName + ' returned 404. Skipping it for the rest of this run...');
         break;
       }
 
@@ -463,6 +552,22 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
         useThinking = false;
         attempt--;
         continue;
+      }
+
+      // Setup problems: the same error would hit every file, so stop instead of blaming this one
+      if (status === 400 && /API_KEY_INVALID|API key not valid|API key expired/i.test(body)) {
+        return { apiError: true, systemic: true,
+                 reason: 'The Gemini API key was rejected (invalid or expired). Check GEMINI_API_KEY in Script Properties.' };
+      }
+      if (status === 401 || status === 403) {
+        return { apiError: true, systemic: true,
+                 reason: 'Gemini refused access [' + status + ']: the API key, billing or the Generative Language API ' +
+                         'may be disabled. Details: ' + body.substring(0, 300) };
+      }
+      if (/FAILED_PRECONDITION/.test(body)) {
+        return { apiError: true, systemic: true,
+                 reason: 'Gemini returned FAILED_PRECONDITION (often billing or region settings). Details: ' +
+                         body.substring(0, 300) };
       }
 
       if (status === 429) {
@@ -485,10 +590,18 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
       }
 
       Logger.log('Gemini API Error Status [' + status + ']: ' + body.substring(0, 500));
-      return { apiError: true };
+      // errorKey lets the run spot the same error hitting several files
+      let message = '';
+      try { message = (JSON.parse(body).error || {}).message || ''; } catch (e) { message = body; }
+      return { apiError: true, status: status, errorKey: status + ': ' + String(message).substring(0, 120) };
     }
   }
 
+  if (notFoundCount === GEMINI_MODELS.length) {
+    return { apiError: true, systemic: true,
+             reason: 'Every model in GEMINI_MODELS returned 404 (not found): ' + GEMINI_MODELS.join(', ') +
+                     '. The model names may have been retired. Check the current names in Google AI Studio.' };
+  }
   if (lastStatus === 429) return { apiError: true, quotaHit: true };
   if (lastStatus === 503 || lastStatus === 500 || (sawException && lastStatus === null)) {
     return { apiError: true, transient: true };
@@ -601,6 +714,16 @@ function claimNoteFor_(result, subCategoryName) {
   return '';
 }
 
+// Models that returned 404 in the current run (reset at the start of each run)
+let RETIRED_MODELS_ = {};
+
+// Receipt_Email_Grab_2026-11-13.pdf  ->  13 Nov 2026 (the email's date), else null
+function emailDateFromName_(name) {
+  const m = /^Receipt_Email_[A-Za-z0-9]+_(\d{4})-(\d{2})-(\d{2})(?:_\d+)?\.[A-Za-z]+$/.exec(String(name || ''));
+  if (!m) return null;
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 4, 0, 0));   // noon in Malaysia
+}
+
 function msUntilPacificMidnight_() {
   const now = new Date();
   const h = Number(Utilities.formatDate(now, 'America/Los_Angeles', 'H'));
@@ -620,7 +743,7 @@ function validateTransactionDate_(raw, scanDate) {
   const oldest = scanDay - MAX_RECEIPT_AGE_YEARS * 365.25 * oneDay;
 
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(raw || ''));
-  if (!match) return { dateStr: fallback, note: 'Date unreadable, used scan date' };
+  if (!match) return { dateStr: fallback, note: 'Date unreadable, used scan/email date' };
 
   const y = Number(match[1]), mo = Number(match[2]), d = Number(match[3]);
   const isOk = t => t !== null && t <= scanDay + oneDay && t >= oldest;
@@ -634,7 +757,7 @@ function validateTransactionDate_(raw, scanDate) {
     return { dateStr: swappedStr, note: 'Day/month swapped from ' + raw + ', please check' };
   }
 
-  return { dateStr: fallback, note: 'Printed date ' + raw + ' looked wrong, used scan date' };
+  return { dateStr: fallback, note: 'Printed date ' + raw + ' looked wrong, used scan/email date' };
 }
 
 function realDate_(y, mo, d) {
@@ -806,29 +929,73 @@ function getTrackerSheet_(props) {
   return sheet;
 }
 
+// File IDs already logged. A row only counts if it also has a vendor, amount or link,
+// so a half-cleared row (File ID left behind) can't block a receipt from being logged again.
 function getLoggedFileIds_(sheet) {
   const ids = new Set();
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return ids;
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const col = headers.indexOf('File ID') + 1;
-  if (col === 0) return ids;
-  sheet.getRange(2, col, lastRow - 1, 1).getValues().forEach(row => {
-    if (row[0]) ids.add(String(row[0]));
-  });
+  const data = sheet.getRange(1, 1, lastRow, sheet.getLastColumn()).getValues();
+  const headers = data[0];
+  const idCol = headers.indexOf('File ID');
+  if (idCol === -1) return ids;
+  const contentCols = ['Vendor', 'Amount', 'Receipt Link'].map(h => headers.indexOf(h)).filter(i => i !== -1);
+
+  let ignored = 0;
+  for (let r = 1; r < data.length; r++) {
+    const id = data[r][idCol];
+    if (!id) continue;
+    const hasContent = contentCols.some(c => data[r][c] !== '' && data[r][c] !== null);
+    if (hasContent) {
+      ids.add(String(id));
+    } else {
+      ignored++;
+    }
+  }
+  if (ignored > 0) {
+    Logger.log('Tracker: ignored ' + ignored + ' blank row(s) that only had a File ID. ' +
+               'Run cleanupBlankTrackerRows to remove them.');
+  }
   return ids;
+}
+
+// Manual clean-up: deletes rows with no Vendor, Amount or Receipt Link
+// (for example rows that were cleared by hand but still hold a File ID).
+function cleanupBlankTrackerRows() {
+  const sheet = getTrackerSheet_(PropertiesService.getScriptProperties());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) { Logger.log('Nothing to clean up.'); return; }
+  const data = sheet.getRange(1, 1, lastRow, sheet.getLastColumn()).getValues();
+  const headers = data[0];
+  const contentCols = ['Vendor', 'Amount', 'Receipt Link'].map(h => headers.indexOf(h)).filter(i => i !== -1);
+  if (contentCols.length === 0) { Logger.log('Headers not recognised. Nothing deleted.'); return; }
+
+  const blankRows = [];
+  for (let r = 1; r < data.length; r++) {
+    const hasContent = contentCols.some(c => data[r][c] !== '' && data[r][c] !== null);
+    if (!hasContent) blankRows.push(r + 1);   // sheet row number
+  }
+  // Delete from the bottom up so row numbers don't shift
+  blankRows.reverse().forEach(rowNum => sheet.deleteRow(rowNum));
+  Logger.log(blankRows.length ? 'Deleted blank row(s): ' + blankRows.reverse().join(', ') : 'No blank rows found.');
 }
 
 
 
 // =========================================================
-// EMAIL RECEIPT IMPORT (v5)
+// EMAIL RECEIPT IMPORT (v6)
 // Finds receipt emails in Gmail and saves them into Brother:
 //   - PDF / JPEG / PNG attachments are saved as they are
 //   - emails with no such attachment are saved as a PDF snapshot of the email
-// Each email thread is then labelled so it is never imported twice.
-// Anything that can't be imported is labelled Receipt-Failed and emailed to you.
+// Every email MESSAGE handled gets a row in the "Email Import Log" tab of the
+// tracker sheet, so a new receipt arriving in an old Gmail conversation is still
+// picked up. Identical attachments (e.g. a receipt you forwarded) are saved once.
+// Gmail labels are added so you can see what happened in Gmail.
+// To retry an email: delete its row in the Email Import Log tab.
 // =========================================================
+
+const EMAIL_LOG_HEADERS = ['Logged At', 'Message ID', 'Thread ID', 'Email Date', 'From', 'Subject',
+                           'Status', 'Files Saved', 'Content Hashes', 'Note'];
 
 // Manual run: imports emails only (no classification). Handy for testing.
 function importEmailReceipts() {
@@ -844,25 +1011,42 @@ function importEmailReceipts() {
   }
 }
 
-// Dry run: lists what WOULD be imported. Saves nothing, labels nothing, costs nothing.
+// Dry run: lists up to 50 emails that WOULD be handled. Saves nothing, labels nothing, costs nothing.
 function testEmailSearch() {
-  const query = buildEmailQuery_();
+  const props = PropertiesService.getScriptProperties();
+  const state = loadEmailLog_(props, false);
+  const migrated = props.getProperty('EMAIL_LOG_MIGRATED') === 'true';
+  const oldLabels = [EMAIL_IMPORTED_LABEL, EMAIL_FAILED_LABEL, EMAIL_SKIPPED_LABEL];
+  const startMs = new Date(EMAIL_START_DATE).getTime();
+  const query = buildEmailQuery_(emailWindowStart_(props));
   Logger.log('Gmail search: ' + query);
-  const threads = GmailApp.search(query, 0, EMAIL_MAX_THREADS_PER_RUN);
-  Logger.log('Matching threads: ' + threads.length);
-  threads.forEach(thread => {
-    thread.getMessages().forEach(message => {
-      if (!isReceiptMessage_(message)) return;
-      const usable = getUsableAttachments_(message);
-      Logger.log(Utilities.formatDate(message.getDate(), TZ, 'yyyy-MM-dd') + ' | ' +
-                 message.getFrom() + ' | ' + message.getSubject() + ' | ' +
-                 (usable.length ? usable.length + ' attachment(s) to save' : 'no attachment: email -> PDF'));
+
+  let shown = 0;
+  for (let page = 0; page < EMAIL_MAX_PAGES_PER_RUN && shown < 50; page++) {
+    const threads = GmailApp.search(query, page * EMAIL_PAGE_SIZE, EMAIL_PAGE_SIZE);
+    threads.forEach(thread => {
+      // Before the first real v6 run, emails handled by v5 (labelled) count as done
+      const handledByV5 = !migrated && thread.getLabels().some(l => oldLabels.indexOf(l.getName()) !== -1);
+      if (handledByV5) return;
+      thread.getMessages().forEach(message => {
+        if (shown >= 50 || state.ids.has(message.getId()) || message.getDate().getTime() < startMs) return;
+        const decision = decideMessage_(message, thread);
+        const usable = decision.skip ? [] : getUsableAttachments_(message);
+        Logger.log(Utilities.formatDate(message.getDate(), TZ, 'yyyy-MM-dd') + ' | ' +
+                   message.getFrom() + ' | ' + message.getSubject() + ' | ' +
+                   (decision.skip ? 'skip: ' + decision.reason
+                                  : (usable.length ? usable.length + ' attachment(s) to save' : 'no attachment: email -> PDF')));
+        shown++;
+      });
     });
-  });
+    if (threads.length < EMAIL_PAGE_SIZE) break;
+  }
+  Logger.log('Listed ' + shown + ' new email(s) (max 50). Nothing was saved or labelled.');
 }
 
 function importEmailReceipts_(deadline) {
   if (!EMAIL_IMPORT_ENABLED) return;
+  const props = PropertiesService.getScriptProperties();
 
   const brother = findChildFolder_(DriveApp.getRootFolder(), SOURCE_FOLDER_NAME);
   if (!brother) {
@@ -870,67 +1054,129 @@ function importEmailReceipts_(deadline) {
     return;
   }
 
-  const importedLabel = getOrCreateLabel_(EMAIL_IMPORTED_LABEL);
-  const failedLabel = getOrCreateLabel_(EMAIL_FAILED_LABEL);
-  const skippedLabel = getOrCreateLabel_(EMAIL_SKIPPED_LABEL);
+  const state = loadEmailLog_(props, true);
+  migrateV5Labels_(props, state);
 
-  const threads = GmailApp.search(buildEmailQuery_(), 0, EMAIL_MAX_THREADS_PER_RUN);
-  Logger.log('Email import: ' + threads.length + ' matching thread(s).');
+  const labels = {
+    Imported: getOrCreateLabel_(EMAIL_IMPORTED_LABEL),
+    Failed: getOrCreateLabel_(EMAIL_FAILED_LABEL),
+    Skipped: getOrCreateLabel_(EMAIL_SKIPPED_LABEL),
+    Duplicate: getOrCreateLabel_(EMAIL_SKIPPED_LABEL)
+  };
 
+  // Daily cap (Malaysia day)
+  const today = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  if (props.getProperty('EMAIL_CAP_DAY') !== today) {
+    props.setProperty('EMAIL_CAP_DAY', today);
+    props.setProperty('EMAIL_CAP_COUNT', '0');
+  }
+  let savedToday = Number(props.getProperty('EMAIL_CAP_COUNT') || 0);
+
+  const startMs = new Date(EMAIL_START_DATE).getTime();
+  const query = buildEmailQuery_(emailWindowStart_(props));
   const failures = [];
   let savedTotal = 0;
+  let handled = 0;
+  let reachedEnd = false;
+  let stopReason = '';
 
-  for (let t = 0; t < threads.length; t++) {
-    if (Date.now() > deadline) {
-      Logger.log('Email import: time budget used. Remaining emails will be imported next run.');
-      break;
+  pages:
+  for (let page = 0; page < EMAIL_MAX_PAGES_PER_RUN; page++) {
+    const threads = GmailApp.search(query, page * EMAIL_PAGE_SIZE, EMAIL_PAGE_SIZE);
+    for (let t = 0; t < threads.length; t++) {
+      const thread = threads[t];
+      const messages = thread.getMessages();
+      for (let m = 0; m < messages.length; m++) {
+        const message = messages[m];
+        if (state.ids.has(message.getId())) continue;                 // already handled
+        if (message.getDate().getTime() < startMs) continue;          // older message in an active conversation
+        if (Date.now() > deadline) { stopReason = 'time budget used'; break pages; }
+        if (savedToday >= EMAIL_MAX_FILES_PER_DAY) { stopReason = 'daily cap of ' + EMAIL_MAX_FILES_PER_DAY + ' files reached'; break pages; }
+
+        const outcome = handleEmailMessage_(message, thread, brother, state);
+        // Record first, then label: the log is what prevents repeats
+        logEmailMessage_(state, message, thread, outcome);
+        addLabelSafely_(thread, labels[outcome.status]);
+        if (outcome.status === 'Imported' && outcome.failures.length) addLabelSafely_(thread, labels.Failed);
+
+        savedTotal += outcome.saved;
+        savedToday += outcome.saved;
+        props.setProperty('EMAIL_CAP_COUNT', String(savedToday));
+        outcome.failures.forEach(reason => failures.push(describeFailure_(message, thread, reason)));
+        handled++;
+      }
     }
-    const thread = threads[t];
-    let threadSaved = 0;
-    const threadFailures = [];
-
-    try {
-      thread.getMessages().forEach(message => {
-        if (!isReceiptMessage_(message)) return;
-        const result = importMessage_(message, brother);
-        threadSaved += result.saved;
-        result.failures.forEach(reason => threadFailures.push(describeFailure_(message, thread, reason)));
-      });
-    } catch (e) {
-      threadFailures.push(describeFailure_(thread.getMessages()[0], thread, 'Unexpected error: ' + e));
-    }
-
-    // Label only after the files are saved, so nothing is marked done by mistake
-    if (threadSaved > 0) thread.addLabel(importedLabel);
-    if (threadFailures.length > 0) {
-      thread.addLabel(failedLabel);
-      threadFailures.forEach(f => failures.push(f));
-    }
-    if (threadSaved === 0 && threadFailures.length === 0) thread.addLabel(skippedLabel);
-
-    savedTotal += threadSaved;
+    if (threads.length < EMAIL_PAGE_SIZE) { reachedEnd = true; break; }
   }
 
-  Logger.log('Email import complete. Files saved to Brother: ' + savedTotal + ', Failed: ' + failures.length);
+  if (reachedEnd && props.getProperty('EMAIL_BACKLOG_DONE') !== 'true') {
+    props.setProperty('EMAIL_BACKLOG_DONE', 'true');
+    Logger.log('Email import: backlog cleared. From now on only the last ' + EMAIL_RESCAN_DAYS + ' days are checked.');
+  }
+  Logger.log('Email import complete. Messages handled: ' + handled + ', files saved: ' + savedTotal +
+             ', failed: ' + failures.length + (stopReason ? ' (stopped early: ' + stopReason + ')' : ''));
   if (failures.length > 0) sendImportFailureEmail_(failures);
 }
 
-function buildEmailQuery_() {
+// Search window: from EMAIL_START_DATE during the backlog, then only the last EMAIL_RESCAN_DAYS days
+function emailWindowStart_(props) {
+  const startSec = Math.floor(new Date(EMAIL_START_DATE).getTime() / 1000);
+  if (props.getProperty('EMAIL_BACKLOG_DONE') !== 'true') return startSec;
+  return Math.max(startSec, Math.floor(Date.now() / 1000) - EMAIL_RESCAN_DAYS * 86400);
+}
+
+function buildEmailQuery_(afterSeconds) {
   const excluded = EMAIL_EXCLUDE_SUBJECT_WORDS
     .map(w => ' -subject:' + (w.indexOf(' ') !== -1 ? '"' + w + '"' : w))
     .join('');
   const excludedSenders = EMAIL_EXCLUDE_SENDERS
     .map(s => ' -from:"' + s.replace(/"/g, '') + '"')
     .join('');
+  // after:<seconds> is exact; after:YYYY/MM/DD would be read in US Pacific time
   return '(' + EMAIL_KEYWORDS.join(' OR ') + ') ' + EMAIL_EXTRA_FILTERS + excluded + excludedSenders +
-         // after:<seconds> is exact; after:YYYY/MM/DD would be read in US Pacific time
-         ' after:' + Math.floor(new Date(EMAIL_START_DATE).getTime() / 1000) +
-         ' -label:' + EMAIL_IMPORTED_LABEL +
-         ' -label:' + EMAIL_FAILED_LABEL +
-         ' -label:' + EMAIL_SKIPPED_LABEL;
+         ' after:' + afterSeconds;
 }
 
-// Only messages that mention a keyword. Skips our own notices, excluded subjects,
+// Decides whether a message should be imported, before anything is saved
+function decideMessage_(message, thread) {
+  if (!isReceiptMessage_(message)) return { skip: true, reason: 'Not a receipt, or filtered out' };
+  if (isForward_(message.getSubject()) && threadHasOriginalReceipt_(thread, message)) {
+    return { skip: true, reason: 'Forward of a receipt already in this conversation' };
+  }
+  return { skip: false };
+}
+
+function isForward_(subject) {
+  return /^\s*(fwd?|fw)\s*:/i.test(subject || '');
+}
+
+// True when the same conversation already holds the original (non-forwarded) receipt
+function threadHasOriginalReceipt_(thread, forwardMessage) {
+  return thread.getMessages().some(m =>
+    m.getId() !== forwardMessage.getId() &&
+    !isForward_(m.getSubject()) &&
+    !isFromMe_(m.getFrom()) &&
+    isReceiptMessage_(m));
+}
+
+function handleEmailMessage_(message, thread, brother, state) {
+  const decision = decideMessage_(message, thread);
+  if (decision.skip) {
+    return { status: 'Skipped', saved: 0, hashes: [], failures: [], note: decision.reason };
+  }
+  const r = importMessage_(message, brother, state);
+  let status;
+  if (r.saved > 0) status = 'Imported';
+  else if (r.failures.length > 0) status = 'Failed';
+  else if (r.duplicates > 0) status = 'Duplicate';
+  else status = 'Skipped';
+  const notes = r.notes.slice();
+  if (r.duplicates > 0) notes.push(r.duplicates + ' identical file(s) already saved earlier');
+  r.failures.forEach(f => notes.push('FAILED: ' + f));
+  return { status: status, saved: r.saved, hashes: r.hashes, failures: r.failures, note: notes.join('; ') };
+}
+
+// Only messages that mention a keyword. Skips our own notices, excluded subjects and senders,
 // and emails you sent yourself (unless you forwarded them, e.g. "Fwd: Receipt").
 function isReceiptMessage_(message) {
   const subject = message.getSubject() || '';
@@ -942,8 +1188,7 @@ function isReceiptMessage_(message) {
   const lowerFrom = String(message.getFrom() || '').toLowerCase();
   if (EMAIL_EXCLUDE_SENDERS.some(s => lowerFrom.indexOf(s.toLowerCase()) !== -1)) return false;
 
-  const isForward = /^\s*(fwd?|fw)\s*:/i.test(subject);
-  if (!isForward && isFromMe_(message.getFrom())) return false;
+  if (!isForward_(subject) && isFromMe_(message.getFrom())) return false;
 
   const re = new RegExp('\\b(' + EMAIL_KEYWORDS.join('|') + ')', 'i');
   const names = message.getAttachments({ includeInlineImages: false }).map(a => a.getName()).join(' ');
@@ -963,8 +1208,8 @@ function getUsableAttachments_(message) {
   return usable;
 }
 
-function importMessage_(message, brother) {
-  const out = { saved: 0, failures: [] };
+function importMessage_(message, brother, state) {
+  const out = { saved: 0, failures: [], duplicates: 0, hashes: [], notes: [] };
   const base = 'Receipt_Email_' + senderTag_(message.getFrom()) + '_' +
                Utilities.formatDate(message.getDate(), TZ, 'yyyy-MM-dd');
   const usable = getUsableAttachments_(message);
@@ -979,14 +1224,23 @@ function importMessage_(message, brother) {
           return;
         }
         const blob = item.att.copyBlob();
-        if (item.type === MimeType.PDF && isEncryptedPdf_(blob)) {
-          out.failures.push('Attachment "' + label + '" is password-protected, so it can\'t be read automatically');
+        const hash = contentHash_(blob.getBytes());
+        if (state.hashes.has(hash)) {
+          out.duplicates++;
+          Logger.log('Email import: skipped identical copy of ' + label);
           return;
+        }
+        // Many bank/telco PDFs are print-restricted but still readable, so they go through.
+        // If one really can't be read, the classifier's 3-strike rule moves it to Failed.
+        if (item.type === MimeType.PDF && isEncryptedPdf_(blob)) {
+          out.notes.push('"' + label + '" may be password-protected');
         }
         blob.setContentType(item.type);   // some senders label PDFs as generic files
         blob.setName(base + (usable.length > 1 ? '_' + (i + 1) : '') + extensionFor_(item.type));
         brother.createFile(blob);
         out.saved++;
+        out.hashes.push(hash);
+        state.hashes.add(hash);
         Logger.log('Email import: saved attachment ' + blob.getName());
       } catch (e) {
         out.failures.push('Could not save attachment "' + label + '": ' + e);
@@ -1003,18 +1257,105 @@ function importMessage_(message, brother) {
       return out;
     }
     const pdf = emailToPdf_(message);
-    if (pdf.getBytes().length > MAX_FILE_BYTES) {
+    const bytes = pdf.getBytes();
+    if (bytes.length > MAX_FILE_BYTES) {
       out.failures.push('The email converted to a PDF larger than ' + Math.round(MAX_FILE_BYTES / 1048576) + ' MB');
       return out;
     }
     pdf.setName(base + '.pdf');
     brother.createFile(pdf);
     out.saved++;
+    out.hashes.push(contentHash_(bytes));
     Logger.log('Email import: saved email snapshot ' + pdf.getName());
   } catch (e) {
     out.failures.push('Could not convert the email to a PDF: ' + e);
   }
   return out;
+}
+
+// Short fingerprint of a file's content (first 32 hex characters of SHA-256)
+function contentHash_(bytes) {
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes);
+  return Array.prototype.slice.call(digest)
+    .map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('').substring(0, 32);
+}
+
+// ---- Email Import Log tab ----
+
+// Reads the log into fast lookups. create=false never changes the sheet (used by the dry run).
+function loadEmailLog_(props, create) {
+  const ss = getTrackerSheet_(props).getParent();
+  let sheet = ss.getSheetByName(EMAIL_LOG_TAB_NAME);
+  if (!sheet && create) {
+    sheet = ss.insertSheet(EMAIL_LOG_TAB_NAME);
+    sheet.appendRow(EMAIL_LOG_HEADERS);
+    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, EMAIL_LOG_HEADERS.length).setFontWeight('bold');
+  }
+  const ids = new Set();
+  const hashes = new Set();
+  if (sheet && sheet.getLastRow() >= 2) {
+    const idCol = EMAIL_LOG_HEADERS.indexOf('Message ID');
+    const hashCol = EMAIL_LOG_HEADERS.indexOf('Content Hashes');
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, EMAIL_LOG_HEADERS.length).getValues().forEach(row => {
+      if (row[idCol]) ids.add(String(row[idCol]));
+      String(row[hashCol] || '').split(',').forEach(h => { if (h.trim()) hashes.add(h.trim()); });
+    });
+  }
+  return { sheet: sheet, ids: ids, hashes: hashes };
+}
+
+function logEmailMessage_(state, message, thread, outcome) {
+  state.sheet.appendRow([
+    new Date(),
+    safeCell_(message.getId()),
+    safeCell_(thread.getId()),
+    message.getDate(),
+    safeCell_(message.getFrom()),
+    safeCell_(message.getSubject()),
+    outcome.status,
+    outcome.saved,
+    outcome.hashes.join(','),
+    safeCell_(outcome.note)
+  ]);
+  state.ids.add(message.getId());
+  outcome.hashes.forEach(h => state.hashes.add(h));
+}
+
+// One-off: emails already handled by v5 (found by its Gmail labels) are recorded as done,
+// so the switch to the log doesn't import them a second time.
+function migrateV5Labels_(props, state) {
+  if (props.getProperty('EMAIL_LOG_MIGRATED') === 'true') return;
+  const rows = [];
+  [EMAIL_IMPORTED_LABEL, EMAIL_FAILED_LABEL, EMAIL_SKIPPED_LABEL].forEach(name => {
+    const label = GmailApp.getUserLabelByName(name);
+    if (!label) return;
+    for (let start = 0; ; start += 100) {
+      const threads = label.getThreads(start, 100);
+      threads.forEach(thread => thread.getMessages().forEach(message => {
+        const id = message.getId();
+        if (state.ids.has(id)) return;
+        state.ids.add(id);
+        rows.push([new Date(), safeCell_(id), safeCell_(thread.getId()), message.getDate(),
+                   safeCell_(message.getFrom()), safeCell_(message.getSubject()),
+                   'Migrated', 0, '', 'Handled by v5 (Gmail label ' + name + ')']);
+      }));
+      if (threads.length < 100) break;
+    }
+  });
+  if (rows.length) {
+    state.sheet.getRange(state.sheet.getLastRow() + 1, 1, rows.length, EMAIL_LOG_HEADERS.length).setValues(rows);
+  }
+  props.setProperty('EMAIL_LOG_MIGRATED', 'true');
+  Logger.log('Email import: recorded ' + rows.length + ' message(s) already handled by v5.');
+}
+
+function addLabelSafely_(thread, label) {
+  try {
+    if (label) thread.addLabel(label);
+  } catch (e) {
+    Logger.log('Could not add Gmail label (the log still records the email): ' + e);
+  }
 }
 
 // Builds "From / Subject / Date" header + the email body, then converts to PDF (no AI involved)
@@ -1028,8 +1369,9 @@ function emailToPdf_(message) {
     const bodyMatch = /<body[^>]*>([\s\S]*)<\/body>/i.exec(raw);
     content = (bodyMatch ? bodyMatch[1] : raw)
       .replace(/<script[\s\S]*?<\/script>/gi, '')
-      // Images are removed: remote ones usually fail to load and can stall the conversion.
-      .replace(/<img\b[^>]*>/gi, '');
+      // Images and remote stylesheets are removed: they usually fail to load and can stall the conversion.
+      .replace(/<img\b[^>]*>/gi, '')
+      .replace(/<link\b[^>]*>/gi, '');
   } else {
     content = '<pre style="white-space:pre-wrap;font-family:Arial,sans-serif;font-size:12px">' +
               escapeHtml_(message.getPlainBody() || '') + '</pre>';
@@ -1131,10 +1473,184 @@ function sendImportFailureEmail_(failures) {
             '   Open email: ' + f.link + '\n\n';
   });
   body += 'What you can do:\n' +
-          '- Save the receipt into the Brother folder yourself (e.g. unlock a password-protected PDF first), or\n' +
+          '- Save the receipt into the Brother folder yourself, or\n' +
           '- Ignore it if it isn\'t a receipt.\n\n' +
-          'To make the script try again, remove the "' + EMAIL_FAILED_LABEL + '" label from the email ' +
-          '(only if it doesn\'t also have the "' + EMAIL_IMPORTED_LABEL + '" label).\n';
+          'To make the script try again, delete that email\'s row in the "' + EMAIL_LOG_TAB_NAME + '" tab ' +
+          'of your ' + TRACKER_SHEET_NAME + ' sheet.\n';
 
   MailApp.sendEmail(email, 'Drive Classifier Notice: Email receipts need your attention', body);
+}
+
+
+// =========================================================
+// HEALTH CHECKS (v6)
+// - Setup problems pause the run and email you (at most once a day)
+// - A weekly summary email doubles as a heartbeat: if it stops arriving,
+//   the trigger has probably stopped
+// =========================================================
+
+// Records how the last run ended. problem = '' means healthy.
+function recordRunStatus_(props, problem) {
+  if (problem) {
+    props.setProperty('LAST_RUN_PROBLEM', problem);
+  } else {
+    props.setProperty('LAST_RUN_OK', String(Date.now()));
+    props.deleteProperty('LAST_RUN_PROBLEM');
+  }
+}
+
+// Emails you about a setup problem, at most once per day
+function sendSetupAlert_(props, reason) {
+  const today = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  if (props.getProperty('SETUP_ALERT_DAY') === today) {
+    Logger.log('Setup alert already sent today. Not sending again.');
+    return;
+  }
+  const email = Session.getEffectiveUser().getEmail();
+  if (!email) return;
+
+  const body =
+    'Hello,\n\n' +
+    'The Drive Classifier found a setup problem and paused processing:\n\n' +
+    '   ' + reason + '\n\n' +
+    'Your files are safe. They stay in the ' + SOURCE_FOLDER_NAME + ' folder and are NOT counted as failures.\n' +
+    'The script tries again on every scheduled run and carries on by itself once the problem is fixed.\n\n' +
+    'Things to check:\n' +
+    '- Google AI Studio: is the API key active, and are the model names in GEMINI_MODELS still listed?\n' +
+    '- Google Cloud: is billing on and the Generative Language API enabled?\n' +
+    '- Apps Script > Project Settings > Script Properties: is GEMINI_API_KEY set?\n\n' +
+    'You will get at most one of these emails per day.\n';
+
+  MailApp.sendEmail(email, 'Drive Classifier Alert: setup problem, processing paused', body);
+  props.setProperty('SETUP_ALERT_DAY', today);
+  Logger.log('Setup alert emailed.');
+}
+
+// Called at the end of every trigger run; sends the summary once every SUMMARY_INTERVAL_DAYS
+function maybeSendWeeklySummary_() {
+  const props = PropertiesService.getScriptProperties();
+  const last = Number(props.getProperty('LAST_SUMMARY_SENT') || 0);
+  const interval = SUMMARY_INTERVAL_DAYS * 24 * 60 * 60 * 1000;
+  if (Date.now() - last < interval) return;
+  sendWeeklySummary_(props);
+  props.setProperty('LAST_SUMMARY_SENT', String(Date.now()));
+}
+
+// Manual run: sends the summary right now (does not change the weekly schedule)
+function sendWeeklySummaryNow() {
+  sendWeeklySummary_(PropertiesService.getScriptProperties());
+}
+
+function sendWeeklySummary_(props) {
+  const email = Session.getEffectiveUser().getEmail();
+  if (!email) return;
+  const now = Date.now();
+  const since = now - SUMMARY_INTERVAL_DAYS * 24 * 60 * 60 * 1000;
+
+  // ---- Receipts logged in the period ----
+  let logged = 0, claimable = 0, withNotes = 0, claimableMyr = 0, claimableOther = 0;
+  const byRelief = {};
+  try {
+    const sheet = getTrackerSheet_(props);
+    const lastRow = sheet.getLastRow();
+    if (lastRow >= 2) {
+      const data = sheet.getRange(1, 1, lastRow, sheet.getLastColumn()).getValues();
+      const h = data[0];
+      const c = name => h.indexOf(name);
+      for (let r = 1; r < data.length; r++) {
+        const row = data[r];
+        const loggedAt = row[c('Logged At')];
+        if (!loggedAt || typeof loggedAt.getTime !== 'function' || loggedAt.getTime() < since) continue;
+        if (row[c('Vendor')] === '' && row[c('Amount')] === '') continue;   // blank row
+        logged++;
+        const relief = String(row[c('Relief Subcategory')] || '');
+        byRelief[relief] = (byRelief[relief] || 0) + 1;
+        if (relief && relief.indexOf('NC_') !== 0) {
+          claimable++;
+          if (String(row[c('Currency')] || 'MYR') === 'MYR') claimableMyr += Number(row[c('Amount')]) || 0;
+          else claimableOther++;
+        }
+        if (row[c('Notes')]) withNotes++;
+      }
+    }
+  } catch (e) {
+    Logger.log('Summary: could not read the tracker sheet: ' + e);
+  }
+
+  // ---- Files waiting ----
+  const brotherCount = countFilesIn_(findChildFolder_(DriveApp.getRootFolder(), SOURCE_FOLDER_NAME));
+  const failedCount = countFilesIn_(resolveFolder_(props, FAILED_FOLDER_NAME, false));
+
+  // ---- Email import activity in the period ----
+  const emailStats = { Imported: 0, Failed: 0, Duplicate: 0, Skipped: 0 };
+  try {
+    const logSheet = getTrackerSheet_(props).getParent().getSheetByName(EMAIL_LOG_TAB_NAME);
+    if (logSheet && logSheet.getLastRow() >= 2) {
+      const statusCol = EMAIL_LOG_HEADERS.indexOf('Status');
+      logSheet.getRange(2, 1, logSheet.getLastRow() - 1, EMAIL_LOG_HEADERS.length).getValues().forEach(row => {
+        const at = row[0];
+        if (!at || typeof at.getTime !== 'function' || at.getTime() < since) return;
+        if (row[statusCol] in emailStats) emailStats[row[statusCol]]++;
+      });
+    }
+  } catch (e) {
+    Logger.log('Summary: could not read the email log: ' + e);
+  }
+
+  // ---- Health ----
+  const lastOk = Number(props.getProperty('LAST_RUN_OK') || 0);
+  const lastClassified = Number(props.getProperty('LAST_CLASSIFY_SUCCESS') || 0);
+  const problem = props.getProperty('LAST_RUN_PROBLEM');
+  const staleMs = STALE_RUN_HOURS * 60 * 60 * 1000;
+  const hoursAgo = t => Math.round((now - t) / 3600000);
+  let health;
+  if (problem) {
+    health = 'PROBLEM: ' + problem;
+  } else if (!lastOk) {
+    health = 'No successful run recorded yet.';
+  } else if (now - lastOk > staleMs) {
+    health = 'WARNING: last successful run was ' + hoursAgo(lastOk) + ' hours ago. Check Triggers in Apps Script.';
+  } else if (brotherCount > 0 && (!lastClassified || now - lastClassified > staleMs)) {
+    // Runs are happening but nothing gets classified: likely a Gemini outage, quota or billing issue
+    health = 'WARNING: ' + brotherCount + ' file(s) waiting in ' + SOURCE_FOLDER_NAME + ', but nothing was classified ' +
+             (lastClassified ? 'in the last ' + hoursAgo(lastClassified) + ' hours' : 'yet') +
+             '. Check Gemini (quota, billing or an outage) and the execution log.';
+  } else {
+    health = 'OK';
+  }
+  const fmt = t => t ? Utilities.formatDate(new Date(t), TZ, 'd MMM yyyy, HH:mm') + ' (MYT)' : 'never';
+  const lastOkText = fmt(lastOk);
+
+  // ---- Email ----
+  let body = 'Hello,\n\nDrive Classifier summary for the last ' + SUMMARY_INTERVAL_DAYS + ' days:\n\n' +
+    'HEALTH\n' +
+    '- Status: ' + health + '\n' +
+    '- Last successful run: ' + lastOkText + '\n' +
+    '- Last file classified: ' + fmt(lastClassified) + '\n\n' +
+    'RECEIPTS LOGGED\n' +
+    '- Total: ' + logged + ' (claimable: ' + claimable + ', non-claimable: ' + (logged - claimable) + ')\n' +
+    '- Claimable total (MYR): ' + claimableMyr.toFixed(2) +
+    (claimableOther ? ' (' + claimableOther + ' non-MYR receipt(s) not included)' : '') + '\n' +
+    '- Rows with notes to check: ' + withNotes + '\n';
+  Object.keys(byRelief).sort().forEach(k => { body += '   ' + (k || '(none)') + ': ' + byRelief[k] + '\n'; });
+  body += '\nEMAIL IMPORT\n' +
+    '- Imported: ' + emailStats.Imported + ', failed: ' + emailStats.Failed +
+    ', duplicates skipped: ' + emailStats.Duplicate + ', not receipts: ' + emailStats.Skipped + '\n';
+  body += '\nWAITING FOR YOU\n' +
+    '- Files still in ' + SOURCE_FOLDER_NAME + ': ' + brotherCount + '\n' +
+    '- Files in ' + FAILED_FOLDER_NAME + ': ' + failedCount + '\n\n' +
+    'You get this email every ' + SUMMARY_INTERVAL_DAYS + ' days. If it stops arriving, the trigger has probably ' +
+    'stopped: open Apps Script > Triggers to check.\n';
+
+  const subject = 'Drive Classifier Weekly Summary' + (health === 'OK' ? '' : ': needs attention');
+  MailApp.sendEmail(email, subject, body);
+  Logger.log('Weekly summary emailed.');
+}
+
+function countFilesIn_(folder) {
+  if (!folder) return 0;
+  let n = 0;
+  const it = folder.getFiles();
+  while (it.hasNext() && n < 1000) { it.next(); n++; }
+  return n;
 }
