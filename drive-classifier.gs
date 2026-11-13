@@ -1,5 +1,8 @@
 // =========================================================
-// DRIVE CLASSIFIER + RECEIPT TAX TRACKER (v4)
+// DRIVE CLASSIFIER + RECEIPT TAX TRACKER  (v5)
+// v5: imports receipts from Gmail into Brother before classifying
+//     (attachments saved as-is, emails without one saved as a PDF snapshot;
+//     failures are emailed to you). See EMAIL RECEIPT IMPORT section.
 // v4: claimable receipts go to <Tax folder>/YA<year>/<relief folder>
 //     non-claimable receipts stay in [Automated.DNR] Receipts/<year>/05, 06 or 07
 //     Folders not in RECEIPT_SUBCATEGORIES (e.g. 13_...) are filed by hand
@@ -73,6 +76,26 @@ const TRACKER_HEADERS = [
   'Currency', 'Amount', 'Relief Subcategory', 'Notes', 'File Name', 'Receipt Link', 'File ID'
 ];
 
+// Email receipt import (v5)
+const EMAIL_IMPORT_ENABLED = true;                  // set false to switch email import off
+const EMAIL_KEYWORDS = ['receipt', 'invoice', 'resit'];
+// Never import emails older than this (Malaysia time). Labels stop repeats,
+// so a fixed start date does not make daily runs heavier.
+const EMAIL_START_DATE = '2026-01-01T00:00:00+08:00';
+const EMAIL_MAX_THREADS_PER_RUN = 20;
+const EMAIL_IMPORT_BUDGET_MS = 60 * 1000;           // max 1 minute per run, leaves time to classify
+const EMAIL_EXTRA_FILTERS = '-category:promotions -category:social -in:chats -subject:"Drive Classifier"';
+// Emails whose subject contains any of these are never imported (add more if junk shows up)
+const EMAIL_EXCLUDE_SUBJECT_WORDS = ['interview', 'reminder', 'earnings', 'fund transfer', 'welcome'];
+// Emails from these senders are never imported. Use a name or an email address/domain.
+// Example: ['My Condo Management', 'newsletter@example.com']
+const EMAIL_EXCLUDE_SENDERS = [];
+const EMAIL_IMPORTED_LABEL = 'Receipt-Imported';    // saved to Brother
+const EMAIL_FAILED_LABEL = 'Receipt-Failed';        // needs you; you get an email about it
+const EMAIL_SKIPPED_LABEL = 'Receipt-Skipped';      // matched the search but nothing to save
+const EMAIL_MIN_IMAGE_BYTES = 15 * 1024;            // smaller images are usually logos or signatures
+const EMAIL_MIN_BODY_CHARS = 40;                    // less text than this = image-only email
+
 
 // =========================================================
 // ENTRY POINT (point your time-based trigger here)
@@ -84,7 +107,15 @@ function processBrotherFolderFiles() {
     return;
   }
   try {
-    runClassifier_();
+    const runStart = Date.now();
+    // Step 1: pull new email receipts into Brother (errors here never stop classification)
+    try {
+      importEmailReceipts_(runStart + EMAIL_IMPORT_BUDGET_MS);
+    } catch (e) {
+      Logger.log('Email import error (classification continues): ' + e);
+    }
+    // Step 2: classify everything in Brother, including what was just imported
+    runClassifier_(runStart);
   } finally {
     lock.releaseLock();
   }
@@ -94,8 +125,8 @@ function processBrotherFolderFiles() {
 // =========================================================
 // MAIN LOGIC
 // =========================================================
-function runClassifier_() {
-  const startTime = Date.now();
+function runClassifier_(runStart) {
+  const startTime = runStart || Date.now();
   const deadline = startTime + MAX_EXECUTION_TIME_MS;
   const props = PropertiesService.getScriptProperties();
   const apiKey = props.getProperty('GEMINI_API_KEY');
@@ -312,7 +343,7 @@ function runClassifier_() {
           safeCell_(result.currency),
           result.totalAmount,
           subCategoryName,
-          safeCell_(dateCheck.note),
+          safeCell_([dateCheck.note, claimNoteFor_(result, subCategoryName)].filter(Boolean).join('; ')),
           safeCell_(newFileName),
           file.getUrl(),
           safeCell_(fileId)
@@ -412,7 +443,8 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
             receiptSubcategory: d.receipt_subcategory || DEFAULT_SUBCATEGORY,
             totalAmount: typeof d.total_amount === 'number' ? d.total_amount : 0,
             currency: (d.currency || 'MYR').toUpperCase().substring(0, 3),
-            itemSummary: d.item_summary || ''
+            itemSummary: d.item_summary || '',
+            claimNote: d.claim_note || ''
           };
         }
         if (parsed.permanent) return { apiError: true, permanent: true, reason: parsed.reason };
@@ -472,7 +504,7 @@ function buildGeminiRequest_(base64Data, mimeType, apiKey, useThinking) {
     "3. short_title: Concise document type (2 to 3 words max, e.g., 'Payment Receipt', 'Tax Invoice', 'Medical Receipt'). Do not repeat vendor_name or include dates.\n" +
     "4. transaction_date: The actual billing or purchase date printed on the document, returned in 'YYYY-MM-DD' format. Malaysian documents usually print dates as DD/MM/YYYY, so read day before month. If illegible or missing, return 'UNKNOWN'.\n" +
     "5. receipt_subcategory: If category is '[Automated.DNR] Receipts', pick the Malaysian personal tax relief it fits:\n" +
-    "   - '01_Lifestyle': books, magazines, newspapers, PCs, smartphones, tablets, home internet subscriptions.\n" +
+    "   - '01_Lifestyle': books, magazines, newspapers, PCs, smartphones, tablets, internet subscriptions (home fibre/broadband, and mobile phone plans because their data portion is claimable).\n" +
     "   - '02_Sports': sports equipment, gym memberships, sports facility rental, sports competition fees, sports training.\n" +
     "   - '03_Medical_Family': medical treatment, dental, vaccination, full medical exam, health screening or mental health for self, spouse or child.\n" +
     "   - '04_Medical_Parents': medical, dental or care expenses for parents.\n" +
@@ -489,7 +521,8 @@ function buildGeminiRequest_(base64Data, mimeType, apiKey, useThinking) {
     "   - 'NC_General_and_Non_Deductible': everything else (groceries, dining, retail, road tax, utilities), or when category is not Receipts.\n" +
     "6. total_amount: The final total paid as a plain number (e.g., 45.90). If not a receipt or not readable, return 0.\n" +
     "7. currency: 3-letter ISO currency code of the total (e.g., 'MYR', 'SGD', 'USD'). If no currency is shown, return 'MYR'.\n" +
-    "8. item_summary: A short description of what was bought (max 8 words, e.g., 'School stationery and exercise books'). If not a receipt, return ''.";
+    "8. item_summary: A short description of what was bought (max 8 words, e.g., 'School stationery and exercise books'). If not a receipt, return ''.\n" +
+    "9. claim_note: If only part of the amount is claimable, a short note for the taxpayer. For a mobile phone plan that includes calls or SMS, return 'Mobile plan: claim data portion only'. Otherwise return ''.";
 
   const generationConfig = {
     temperature: 0.0,
@@ -505,10 +538,11 @@ function buildGeminiRequest_(base64Data, mimeType, apiKey, useThinking) {
         receipt_subcategory: { type: 'STRING', enum: RECEIPT_SUBCATEGORIES },
         total_amount: { type: 'NUMBER' },
         currency: { type: 'STRING' },
-        item_summary: { type: 'STRING' }
+        item_summary: { type: 'STRING' },
+        claim_note: { type: 'STRING' }
       },
       required: ['category', 'vendor_name', 'short_title', 'transaction_date',
-                 'receipt_subcategory', 'total_amount', 'currency', 'item_summary']
+                 'receipt_subcategory', 'total_amount', 'currency', 'item_summary', 'claim_note']
     }
   };
   if (useThinking) generationConfig.thinkingConfig = THINKING_CONFIG;
@@ -552,6 +586,19 @@ function parseGeminiResponse_(body) {
 
   if (!data || !TARGET_FOLDERS.includes(data.category)) return { ok: false, reason: 'invalid category' };
   return { ok: true, data: data };
+}
+
+// Note for receipts where only part of the amount can be claimed.
+// Uses Gemini's claim_note; falls back to a keyword check for mobile plans in Lifestyle.
+function claimNoteFor_(result, subCategoryName) {
+  const note = String(result.claimNote || '').trim();
+  if (note) return note;
+  if (subCategoryName !== '01_Lifestyle') return '';
+  const text = (result.vendorName + ' ' + result.shortTitle + ' ' + result.itemSummary).toLowerCase();
+  if (/(mobile|postpaid|prepaid|phone plan)/.test(text) && !/(fibre|fiber|broadband|home)/.test(text)) {
+    return 'Mobile plan: claim data portion only';
+  }
+  return '';
 }
 
 function msUntilPacificMidnight_() {
@@ -773,16 +820,321 @@ function getLoggedFileIds_(sheet) {
 }
 
 
+
 // =========================================================
-// OPTIONAL: dry test for the tracker sheet (no Gemini, no files moved)
+// EMAIL RECEIPT IMPORT (v5)
+// Finds receipt emails in Gmail and saves them into Brother:
+//   - PDF / JPEG / PNG attachments are saved as they are
+//   - emails with no such attachment are saved as a PDF snapshot of the email
+// Each email thread is then labelled so it is never imported twice.
+// Anything that can't be imported is labelled Receipt-Failed and emailed to you.
 // =========================================================
-function testTrackerSheet() {
-  const props = PropertiesService.getScriptProperties();
-  const sheet = getTrackerSheet_(props);
-  sheet.appendRow([
-    new Date(), 'YA 2026', Utilities.parseDate('2026-11-01', TZ, 'yyyy-MM-dd'),
-    'TEST Vendor', safeCell_('=SUM(1,1)'), 'MYR', 12.5, '05_Childcare',
-    'Test row, delete me', 'TEST-file.pdf', 'https://drive.google.com', 'TEST-' + Date.now()
-  ]);
-  Logger.log('Tracker sheet: ' + sheet.getParent().getUrl());
+
+// Manual run: imports emails only (no classification). Handy for testing.
+function importEmailReceipts() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) {
+    Logger.log('Another run is still active. Exiting this one.');
+    return;
+  }
+  try {
+    importEmailReceipts_(Date.now() + EMAIL_IMPORT_BUDGET_MS);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Dry run: lists what WOULD be imported. Saves nothing, labels nothing, costs nothing.
+function testEmailSearch() {
+  const query = buildEmailQuery_();
+  Logger.log('Gmail search: ' + query);
+  const threads = GmailApp.search(query, 0, EMAIL_MAX_THREADS_PER_RUN);
+  Logger.log('Matching threads: ' + threads.length);
+  threads.forEach(thread => {
+    thread.getMessages().forEach(message => {
+      if (!isReceiptMessage_(message)) return;
+      const usable = getUsableAttachments_(message);
+      Logger.log(Utilities.formatDate(message.getDate(), TZ, 'yyyy-MM-dd') + ' | ' +
+                 message.getFrom() + ' | ' + message.getSubject() + ' | ' +
+                 (usable.length ? usable.length + ' attachment(s) to save' : 'no attachment: email -> PDF'));
+    });
+  });
+}
+
+function importEmailReceipts_(deadline) {
+  if (!EMAIL_IMPORT_ENABLED) return;
+
+  const brother = findChildFolder_(DriveApp.getRootFolder(), SOURCE_FOLDER_NAME);
+  if (!brother) {
+    Logger.log('Email import: Brother folder not found. Skipping.');
+    return;
+  }
+
+  const importedLabel = getOrCreateLabel_(EMAIL_IMPORTED_LABEL);
+  const failedLabel = getOrCreateLabel_(EMAIL_FAILED_LABEL);
+  const skippedLabel = getOrCreateLabel_(EMAIL_SKIPPED_LABEL);
+
+  const threads = GmailApp.search(buildEmailQuery_(), 0, EMAIL_MAX_THREADS_PER_RUN);
+  Logger.log('Email import: ' + threads.length + ' matching thread(s).');
+
+  const failures = [];
+  let savedTotal = 0;
+
+  for (let t = 0; t < threads.length; t++) {
+    if (Date.now() > deadline) {
+      Logger.log('Email import: time budget used. Remaining emails will be imported next run.');
+      break;
+    }
+    const thread = threads[t];
+    let threadSaved = 0;
+    const threadFailures = [];
+
+    try {
+      thread.getMessages().forEach(message => {
+        if (!isReceiptMessage_(message)) return;
+        const result = importMessage_(message, brother);
+        threadSaved += result.saved;
+        result.failures.forEach(reason => threadFailures.push(describeFailure_(message, thread, reason)));
+      });
+    } catch (e) {
+      threadFailures.push(describeFailure_(thread.getMessages()[0], thread, 'Unexpected error: ' + e));
+    }
+
+    // Label only after the files are saved, so nothing is marked done by mistake
+    if (threadSaved > 0) thread.addLabel(importedLabel);
+    if (threadFailures.length > 0) {
+      thread.addLabel(failedLabel);
+      threadFailures.forEach(f => failures.push(f));
+    }
+    if (threadSaved === 0 && threadFailures.length === 0) thread.addLabel(skippedLabel);
+
+    savedTotal += threadSaved;
+  }
+
+  Logger.log('Email import complete. Files saved to Brother: ' + savedTotal + ', Failed: ' + failures.length);
+  if (failures.length > 0) sendImportFailureEmail_(failures);
+}
+
+function buildEmailQuery_() {
+  const excluded = EMAIL_EXCLUDE_SUBJECT_WORDS
+    .map(w => ' -subject:' + (w.indexOf(' ') !== -1 ? '"' + w + '"' : w))
+    .join('');
+  const excludedSenders = EMAIL_EXCLUDE_SENDERS
+    .map(s => ' -from:"' + s.replace(/"/g, '') + '"')
+    .join('');
+  return '(' + EMAIL_KEYWORDS.join(' OR ') + ') ' + EMAIL_EXTRA_FILTERS + excluded + excludedSenders +
+         // after:<seconds> is exact; after:YYYY/MM/DD would be read in US Pacific time
+         ' after:' + Math.floor(new Date(EMAIL_START_DATE).getTime() / 1000) +
+         ' -label:' + EMAIL_IMPORTED_LABEL +
+         ' -label:' + EMAIL_FAILED_LABEL +
+         ' -label:' + EMAIL_SKIPPED_LABEL;
+}
+
+// Only messages that mention a keyword. Skips our own notices, excluded subjects,
+// and emails you sent yourself (unless you forwarded them, e.g. "Fwd: Receipt").
+function isReceiptMessage_(message) {
+  const subject = message.getSubject() || '';
+  if (/^Drive Classifier/i.test(subject)) return false;
+
+  const lowerSubject = subject.toLowerCase();
+  if (EMAIL_EXCLUDE_SUBJECT_WORDS.some(w => lowerSubject.indexOf(w.toLowerCase()) !== -1)) return false;
+
+  const lowerFrom = String(message.getFrom() || '').toLowerCase();
+  if (EMAIL_EXCLUDE_SENDERS.some(s => lowerFrom.indexOf(s.toLowerCase()) !== -1)) return false;
+
+  const isForward = /^\s*(fwd?|fw)\s*:/i.test(subject);
+  if (!isForward && isFromMe_(message.getFrom())) return false;
+
+  const re = new RegExp('\\b(' + EMAIL_KEYWORDS.join('|') + ')', 'i');
+  const names = message.getAttachments({ includeInlineImages: false }).map(a => a.getName()).join(' ');
+  return re.test(subject + ' ' + names + ' ' + (message.getPlainBody() || ''));
+}
+
+// PDF / JPEG / PNG attachments, minus tiny images such as logos
+function getUsableAttachments_(message) {
+  const usable = [];
+  message.getAttachments({ includeInlineImages: false }).forEach(att => {
+    const type = normaliseMime_(att.getContentType(), att.getName());
+    if (!type) return;
+    const size = att.getSize();
+    if (type !== MimeType.PDF && size < EMAIL_MIN_IMAGE_BYTES) return;
+    usable.push({ att: att, type: type, size: size });
+  });
+  return usable;
+}
+
+function importMessage_(message, brother) {
+  const out = { saved: 0, failures: [] };
+  const base = 'Receipt_Email_' + senderTag_(message.getFrom()) + '_' +
+               Utilities.formatDate(message.getDate(), TZ, 'yyyy-MM-dd');
+  const usable = getUsableAttachments_(message);
+
+  // Case 1: has attachments -> save the attachments only
+  if (usable.length > 0) {
+    usable.forEach((item, i) => {
+      const label = item.att.getName() || ('attachment ' + (i + 1));
+      try {
+        if (item.size > MAX_FILE_BYTES) {
+          out.failures.push('Attachment "' + label + '" is larger than ' + Math.round(MAX_FILE_BYTES / 1048576) + ' MB');
+          return;
+        }
+        const blob = item.att.copyBlob();
+        if (item.type === MimeType.PDF && isEncryptedPdf_(blob)) {
+          out.failures.push('Attachment "' + label + '" is password-protected, so it can\'t be read automatically');
+          return;
+        }
+        blob.setContentType(item.type);   // some senders label PDFs as generic files
+        blob.setName(base + (usable.length > 1 ? '_' + (i + 1) : '') + extensionFor_(item.type));
+        brother.createFile(blob);
+        out.saved++;
+        Logger.log('Email import: saved attachment ' + blob.getName());
+      } catch (e) {
+        out.failures.push('Could not save attachment "' + label + '": ' + e);
+      }
+    });
+    return out;
+  }
+
+  // Case 2: no attachment -> save a PDF snapshot of the email itself
+  try {
+    const plain = (message.getPlainBody() || '').replace(/\s+/g, ' ').trim();
+    if (plain.length < EMAIL_MIN_BODY_CHARS) {
+      out.failures.push('No PDF or image attachment, and the email has almost no text (it may be a single image)');
+      return out;
+    }
+    const pdf = emailToPdf_(message);
+    if (pdf.getBytes().length > MAX_FILE_BYTES) {
+      out.failures.push('The email converted to a PDF larger than ' + Math.round(MAX_FILE_BYTES / 1048576) + ' MB');
+      return out;
+    }
+    pdf.setName(base + '.pdf');
+    brother.createFile(pdf);
+    out.saved++;
+    Logger.log('Email import: saved email snapshot ' + pdf.getName());
+  } catch (e) {
+    out.failures.push('Could not convert the email to a PDF: ' + e);
+  }
+  return out;
+}
+
+// Builds "From / Subject / Date" header + the email body, then converts to PDF (no AI involved)
+function emailToPdf_(message) {
+  const raw = message.getBody() || '';
+  let content;
+  let styles = '';
+
+  if (/<[a-z][\s\S]*>/i.test(raw)) {
+    styles = (raw.match(/<style[\s\S]*?<\/style>/gi) || []).join('\n');
+    const bodyMatch = /<body[^>]*>([\s\S]*)<\/body>/i.exec(raw);
+    content = (bodyMatch ? bodyMatch[1] : raw)
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      // Images are removed: remote ones usually fail to load and can stall the conversion.
+      .replace(/<img\b[^>]*>/gi, '');
+  } else {
+    content = '<pre style="white-space:pre-wrap;font-family:Arial,sans-serif;font-size:12px">' +
+              escapeHtml_(message.getPlainBody() || '') + '</pre>';
+  }
+
+  const header =
+    '<div style="font-family:Arial,sans-serif;font-size:12px;border-bottom:1px solid #999;' +
+    'padding-bottom:8px;margin-bottom:12px">' +
+    '<b>From:</b> ' + escapeHtml_(message.getFrom()) + '<br>' +
+    '<b>Subject:</b> ' + escapeHtml_(message.getSubject()) + '<br>' +
+    '<b>Date:</b> ' + Utilities.formatDate(message.getDate(), TZ, 'd MMM yyyy, HH:mm') + ' (MYT)' +
+    '</div>';
+
+  const html = '<!DOCTYPE html><html><head><meta charset="UTF-8">' + styles + '</head><body>' +
+               header + content + '</body></html>';
+  return Utilities.newBlob(html, MimeType.HTML, 'email.html').getAs(MimeType.PDF);
+}
+
+// "Grab" <no-reply@grab.com>  ->  Grab
+function senderTag_(from) {
+  const text = String(from || '');
+  const m = /^\s*"?([^"<]*?)"?\s*<([^>]+)>/.exec(text);
+  let name = m ? m[1].trim() : '';
+  const address = m ? m[2] : text;
+
+  if (!name || /^(no.?reply|noreply|notifications?|info|support|billing)$/i.test(name)) {
+    const skip = ['com', 'my', 'net', 'org', 'co', 'gov', 'edu', 'email', 'mail', 'e', 'info', 'notification', 'notifications', 'mailer'];
+    const parts = (address.split('@')[1] || '').toLowerCase().split('.');
+    const pick = parts.find(p => p && skip.indexOf(p) === -1) || '';
+    name = pick.charAt(0).toUpperCase() + pick.slice(1);
+  }
+  return name.replace(/[^A-Za-z0-9]+/g, '').substring(0, 25) || 'Unknown';
+}
+
+function normaliseMime_(contentType, fileName) {
+  const t = String(contentType || '').toLowerCase().split(';')[0].trim();
+  const n = String(fileName || '').toLowerCase();
+  if (t === 'application/pdf' || n.endsWith('.pdf')) return MimeType.PDF;
+  if (t === 'image/jpeg' || t === 'image/jpg' || t === 'image/pjpeg' || /\.jpe?g$/.test(n)) return MimeType.JPEG;
+  if (t === 'image/png' || n.endsWith('.png')) return MimeType.PNG;
+  return null;
+}
+
+function extensionFor_(mimeType) {
+  if (mimeType === MimeType.PDF) return '.pdf';
+  if (mimeType === MimeType.JPEG) return '.jpg';
+  if (mimeType === MimeType.PNG) return '.png';
+  return '';
+}
+
+// Password-protected PDFs contain an /Encrypt entry
+function isEncryptedPdf_(blob) {
+  try {
+    return blob.getDataAsString('ISO-8859-1').indexOf('/Encrypt') !== -1;
+  } catch (e) {
+    return false;
+  }
+}
+
+function escapeHtml_(text) {
+  return String(text == null ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// True when the email was sent from your own Google account
+let MY_EMAIL_CACHE_ = null;
+function isFromMe_(from) {
+  if (MY_EMAIL_CACHE_ === null) MY_EMAIL_CACHE_ = String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  if (!MY_EMAIL_CACHE_) return false;
+  const m = /<([^>]+)>/.exec(String(from || ''));
+  const address = (m ? m[1] : String(from || '')).trim().toLowerCase();
+  return address === MY_EMAIL_CACHE_;
+}
+
+function getOrCreateLabel_(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+function describeFailure_(message, thread, reason) {
+  return {
+    subject: message ? message.getSubject() : '(unknown)',
+    from: message ? message.getFrom() : '(unknown)',
+    date: message ? Utilities.formatDate(message.getDate(), TZ, 'd MMM yyyy, HH:mm') : '',
+    reason: reason,
+    link: 'https://mail.google.com/mail/u/0/#all/' + thread.getId()
+  };
+}
+
+function sendImportFailureEmail_(failures) {
+  const email = Session.getEffectiveUser().getEmail();
+  if (!email) return;
+
+  let body = 'Hello,\n\n' + failures.length + ' email receipt(s) could not be imported automatically:\n\n';
+  failures.forEach((f, i) => {
+    body += (i + 1) + '. Subject: ' + f.subject + '\n' +
+            '   From: ' + f.from + '\n' +
+            '   Date: ' + f.date + '\n' +
+            '   Problem: ' + f.reason + '\n' +
+            '   Open email: ' + f.link + '\n\n';
+  });
+  body += 'What you can do:\n' +
+          '- Save the receipt into the Brother folder yourself (e.g. unlock a password-protected PDF first), or\n' +
+          '- Ignore it if it isn\'t a receipt.\n\n' +
+          'To make the script try again, remove the "' + EMAIL_FAILED_LABEL + '" label from the email ' +
+          '(only if it doesn\'t also have the "' + EMAIL_IMPORTED_LABEL + '" label).\n';
+
+  MailApp.sendEmail(email, 'Drive Classifier Notice: Email receipts need your attention', body);
 }

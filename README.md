@@ -1,9 +1,10 @@
 # Drive Classifier + Receipt Tax Tracker
 
-A Google Apps Script that sorts scanned documents in Google Drive with the Gemini API, and files receipts by Malaysian (LHDN) tax relief category, logging each one to a Google Sheet.
+A Google Apps Script that sorts scanned and emailed documents in Google Drive with the Gemini API, and files receipts by Malaysian (LHDN) tax relief category, logging each one to a Google Sheet.
 
 ## What it does
 
+0. **Email import (v5):** finds receipt emails in Gmail and saves them into `Brother`. PDF, JPEG and PNG attachments are saved as-is; emails without one are saved as a PDF snapshot with a From / Subject / Date header.
 1. **Sweep:** moves new mobile scans (PDF, JPEG, PNG named `Scan...`, `Scanned...` or `Receipt...`) from My Drive root into a staging folder called `Brother`.
 2. **Classify:** sends each file to Gemini, which returns the category, vendor, title, date, amount, currency, item summary and tax relief subcategory as structured JSON.
 3. **Rename:** `Vendor - Title-YYYY-MM-DD-HHmm-XXXX.ext` (XXXX = last 4 characters of the file ID, so names stay unique).
@@ -11,7 +12,15 @@ A Google Apps Script that sorts scanned documents in Google Drive with the Gemin
    - Claimable receipts go to `<Tax folder>/YA<year>/<relief folder>` (12 relief folders, from `01_Lifestyle` to `12_Donations`).
    - Non-claimable receipts go to `[Automated.DNR] Receipts/<year>/` under Employment Reimbursements, Major Assets and Warranties, or General and Non-Deductible.
    - Letters, documents and manuals go to their own `[Automated.DNR]` folders.
-5. **Log:** every receipt gets a row in the `Receipt Tax Tracker` sheet (YA, date, vendor, items, currency, amount, relief category, notes, link, file ID). The file ID prevents duplicate rows.
+5. **Log:** every receipt gets a row in the `Receipt Tax Tracker` sheet (YA, date, vendor, items, currency, amount, relief category, notes, link, file ID). The file ID prevents duplicate rows. Partial claims are flagged in Notes (for example, mobile phone plans: "claim data portion only").
+
+## Email import
+
+- **Search:** emails mentioning `receipt`, `invoice` or `resit` since `EMAIL_START_DATE`, leaving out Promotions, Social and chats.
+- **No repeats:** each handled thread is labelled `Receipt-Imported`, `Receipt-Failed` or `Receipt-Skipped`, and labelled threads are left out of later searches. Labels are added only after the file is saved.
+- **Failures emailed to you:** password-protected PDFs, files over 10 MB, image-only emails and conversion errors are labelled `Receipt-Failed` and listed in a notification email with a link to each message. Remove the label to retry.
+- **Junk filters:** `EMAIL_EXCLUDE_SUBJECT_WORDS`, `EMAIL_EXCLUDE_SENDERS`, and emails you sent yourself (forwards with `Fwd:` still count).
+- **Dry run:** `testEmailSearch()` lists what would be imported without saving or labelling anything.
 
 ## Reliability features
 
@@ -34,7 +43,8 @@ A Google Apps Script that sorts scanned documents in Google Drive with the Gemin
 4. In the code, set `TAX_ROOT_FOLDER_ID` to the ID of the folder that holds your `YA<year>` folders.
 5. Create the source folder `Brother` in My Drive root, plus the `[Automated.DNR]` target folders.
 6. Run `testTrackerSheet` once to approve permissions and create the sheet.
-7. Add a time-driven trigger on `processBrotherFolderFiles`.
+7. Set `EMAIL_START_DATE`, then run `testEmailSearch` to approve Gmail access and check the matches. Add junk senders or subject words to the exclude lists if needed (set `EMAIL_IMPORT_ENABLED = false` to turn email import off).
+8. Add one time-driven trigger on `processBrotherFolderFiles` (every 2 hours works well). Each run imports emails first, then classifies.
 
 ## Cost control
 
