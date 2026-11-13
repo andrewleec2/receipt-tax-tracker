@@ -98,9 +98,10 @@ const EMAIL_MAX_FILES_PER_DAY = 40;                 // stops a backlog from usin
 const EMAIL_IMPORT_BUDGET_MS = 60 * 1000;           // max 1 minute per run, leaves time to classify
 const EMAIL_EXTRA_FILTERS = '-category:promotions -category:social -in:chats -subject:"Drive Classifier"';
 // Emails whose subject contains any of these are never imported (add more if junk shows up)
-const EMAIL_EXCLUDE_SUBJECT_WORDS = ['interview', 'reminder', 'earnings', 'fund transfer', 'welcome'];
+const EMAIL_EXCLUDE_SUBJECT_WORDS = ['interview', 'reminder', 'earnings', 'fund transfer', 'welcome',
+                                     'shipping confirmation', 'e-wallet reload', 'shared with you'];
 // Emails from these senders are never imported. Use a name or an email address/domain.
-// Example: ['My Condo Management', 'newsletter@example.com']
+// Example: ['My Condo Management', 'old-employer.com', 'newsletter@example.com']
 const EMAIL_EXCLUDE_SENDERS = [];
 // Gmail labels are for you to see what happened. The Email Import Log decides what is skipped.
 const EMAIL_IMPORTED_LABEL = 'Receipt-Imported';    // saved to Brother
@@ -521,7 +522,7 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
         const parsed = parseGeminiResponse_(body);
         if (parsed.ok) {
           const d = parsed.data;
-          return {
+          const classified = {
             apiError: false,
             category: d.category,
             vendorName: d.vendor_name || 'Unknown',
@@ -533,6 +534,7 @@ function classifyDocumentWithGemini_(file, deadline, props, apiKey) {
             itemSummary: d.item_summary || '',
             claimNote: d.claim_note || ''
           };
+          return applyRefundRule_(classified);
         }
         if (parsed.permanent) return { apiError: true, permanent: true, reason: parsed.reason };
         Logger.log('Unusable answer from ' + modelName + ' (' + parsed.reason + '), attempt ' + attempt + '.');
@@ -627,15 +629,15 @@ function buildGeminiRequest_(base64Data, mimeType, apiKey, useThinking) {
     "   - '08_Edu_Medical_Insurance': education or medical insurance premiums.\n" +
     "   - '09_PRS': Private Retirement Scheme contributions.\n" +
     "   - '10_SSPN': SSPN net deposits.\n" +
-    "   - '11_EV_Charging': EV charging installation, rental, purchase or subscription.\n" +
+    "   - '11_EV_Charging': home EV charger purchase, installation, rental or hire-purchase, or a monthly EV charging subscription plan. Pay-per-use charging sessions at public chargers do NOT qualify: use 'NC_General_and_Non_Deductible' for those.\n" +
     "   - '12_Donations': donations or gifts to approved institutions with an official receipt.\n" +
     "   - 'NC_Employment_Reimbursements': expenses claimable from an employer (parking, mileage, work phone bills).\n" +
     "   - 'NC_Major_Assets_and_Warranties': home appliances, furniture, renovation, vehicle purchase, major repairs, servicing.\n" +
-    "   - 'NC_General_and_Non_Deductible': everything else (groceries, dining, retail, road tax, utilities), or when category is not Receipts.\n" +
-    "6. total_amount: The final total paid as a plain number (e.g., 45.90). If not a receipt or not readable, return 0.\n" +
+    "   - 'NC_General_and_Non_Deductible': everything else (groceries, dining, retail, road tax, utilities, pay-per-use EV charging sessions), or when category is not Receipts.\n" +
+    "6. total_amount: The final total paid as a plain number (e.g., 45.90). If the document is a refund, credit note or reversal, return the amount as a NEGATIVE number (e.g., -12.90). If not a receipt or not readable, return 0.\n" +
     "7. currency: 3-letter ISO currency code of the total (e.g., 'MYR', 'SGD', 'USD'). If no currency is shown, return 'MYR'.\n" +
     "8. item_summary: A short description of what was bought (max 8 words, e.g., 'School stationery and exercise books'). If not a receipt, return ''.\n" +
-    "9. claim_note: If only part of the amount is claimable, a short note for the taxpayer. For a mobile phone plan that includes calls or SMS, return 'Mobile plan: claim data portion only'. Otherwise return ''.";
+    "9. claim_note: If only part of the amount is claimable, a short note for the taxpayer. For a mobile phone plan that includes calls or SMS, return 'Mobile plan: claim data portion only'. For a refund or credit note, return 'Refund / credit note'. Otherwise return ''.";
 
   const generationConfig = {
     temperature: 0.0,
@@ -699,6 +701,19 @@ function parseGeminiResponse_(body) {
 
   if (!data || !TARGET_FOLDERS.includes(data.category)) return { ok: false, reason: 'invalid category' };
   return { ok: true, data: data };
+}
+
+// Refunds and credit notes must reduce totals, not add to them.
+// Backup for when Gemini labels a document as a refund but still returns a positive amount.
+function applyRefundRule_(result) {
+  const text = (result.shortTitle + ' ' + result.itemSummary + ' ' + result.claimNote).toLowerCase();
+  const isRefund = /credit note|refund|reversal/.test(text) || result.totalAmount < 0;
+  if (!isRefund) return result;
+  result.totalAmount = -Math.abs(Number(result.totalAmount) || 0);
+  if (!/refund|credit note/i.test(result.claimNote)) {
+    result.claimNote = result.claimNote ? 'Refund / credit note; ' + result.claimNote : 'Refund / credit note';
+  }
+  return result;
 }
 
 // Note for receipts where only part of the amount can be claimed.

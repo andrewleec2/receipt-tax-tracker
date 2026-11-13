@@ -14,6 +14,12 @@ A Google Apps Script that sorts scanned and emailed documents in Google Drive wi
    - Letters, documents and manuals go to their own `[Automated.DNR]` folders.
 5. **Log:** every receipt gets a row in the `Receipt Tax Tracker` sheet (YA, date, vendor, items, currency, amount, relief category, notes, link, file ID). The file ID prevents duplicate rows. Partial claims are flagged in Notes (for example, mobile phone plans: "claim data portion only").
 
+### Classification rules worth knowing
+
+- **Mobile phone plans** go to `01_Lifestyle` with the note "Mobile plan: claim data portion only" (home fibre is fully claimable).
+- **EV charging:** `11_EV_Charging` covers a home charger (purchase, installation, rental or hire-purchase) or a monthly charging subscription. Pay-per-use charging sessions at public chargers are filed as non-claimable.
+- **Refunds and credit notes** are logged as negative amounts with the note "Refund / credit note", so totals net out. A backup rule makes the amount negative if Gemini labels a refund but returns a positive number.
+
 ## Email import
 
 - **Search:** emails mentioning `receipt`, `invoice` or `resit` since `EMAIL_START_DATE`, leaving out Promotions, Social and chats. Once the backlog is cleared, only the last `EMAIL_RESCAN_DAYS` (45) days are checked.
@@ -21,7 +27,7 @@ A Google Apps Script that sorts scanned and emailed documents in Google Drive wi
 - **No double-logging:** identical attachments are saved once (content hash), and a forward of a receipt that is already in the same conversation is skipped.
 - **Daily cap:** at most `EMAIL_MAX_FILES_PER_DAY` (40) files per day, so a large backlog can't use up the daily Gemini quota. Phone scans are always classified before email imports.
 - **Failures emailed to you:** files over 10 MB, image-only emails and conversion errors are listed in a notification email with a link to each message. To retry, delete the email's row in the Email Import Log tab. Print-restricted PDFs are passed through with a note.
-- **Junk filters:** `EMAIL_EXCLUDE_SUBJECT_WORDS`, `EMAIL_EXCLUDE_SENDERS`, and emails you sent yourself (forwards with `Fwd:` still count).
+- **Junk filters:** `EMAIL_EXCLUDE_SUBJECT_WORDS` (defaults include reminders, shipping confirmations, e-wallet reloads and "shared with you" notices), `EMAIL_EXCLUDE_SENDERS` (add senders or whole domains, such as a former employer), and emails you sent yourself (forwards with `Fwd:` still count).
 - **Dry run:** `testEmailSearch()` lists up to 50 emails that would be handled, without saving, labelling or creating anything.
 
 ## Health checks
